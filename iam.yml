@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: IAM Roles
+
+Resources:
+  # role
+  ECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ecs-service-role-${AWS::StackName}-${AWS::Region}" 
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+                  - elasticloadbalancing:DeregisterTargets
+                  - elasticloadbalancing:Describe*
+                  - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+                  - elasticloadbalancing:RegisterTargets
+                  - ec2:Describe*
+                  - ec2:AuthorizeSecurityGroupIngress
+                Resource: '*'
+  # Allow EC2 instances agent communicate to ECS.
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ecs-hosts-role-${AWS::StackName}-${AWS::Region}" 
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+      Policies:
+        - PolicyName: ecs-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                  - elasticloadbalancing:Describe*
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+  # Association between a role and an instance.
+  ECSHostsInstanceProfile:
+    DependsOn:
+    - EC2Role
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref 'EC2Role'
+
+Outputs:
+  ECSServiceRole:
+    Value: !Ref ECSServiceRole
+    Export:
+      Name: !Sub ${AWS::StackName}-ECSServiceRole
+  EC2Role:
+    Value: !Ref EC2Role
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2Role
+  ECSHostsInstanceProfileArn:
+    Value: !GetAtt ECSHostsInstanceProfile.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ECSHostsInstanceProfile-Arn

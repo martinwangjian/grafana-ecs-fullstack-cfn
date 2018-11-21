@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cloudformation stack for Grafana ECS
+Parameters:
+  NetworkStackName:
+    Description: Stack Name of Network 
+    Type: String
+  SecurityGroupStackName:
+    Description: Stack Name of SecurityGroup
+    Type: String
+  IamStackName:
+    Description: Stack Name of Iam 
+    Type: String
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t2.micro
+      - c5.large
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+  KeyName:
+    Description: EC2 Key Pair to allow SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair
+  
+  CertificateArn:
+    Description: ARN of the ACM SSL certificate
+    Type: String
+  Route53HostedZone:
+    Description: The NAME of the Route53 hosted zone
+    Type: String
+    ConstraintDescription: must be the name of an existing domain name
+
+Mappings:
+  RegionAmazonECSOptimizedAMIMapping:
+    us-east-1:
+      AMI: ami-0a6b7e0cc0b1f464f
+    eu-west-1:
+      AMI: ami-0acc9f8be17a41897
+Conditions:
+  HasKeyName: !Not
+    - !Equals
+      - ''
+      - !Ref 'KeyName'
+Resources:
+
+  # EFS
+  EFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+        - Key: Name
+          Value: EFS-grafana
+
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EFS'
+      SubnetId:
+        Fn::ImportValue: 
+          !Sub "${NetworkStackName}-PrivateSubnet1"
+      SecurityGroups:
+        - Fn::ImportValue: 
+            !Sub "${SecurityGroupStackName}-EFSSecurityGroup"
+
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EFS'
+      SubnetId:
+        Fn::ImportValue: 
+          !Sub "${NetworkStackName}-PrivateSubnet2"
+      SecurityGroups:
+        - Fn::ImportValue: 
+            !Sub "${SecurityGroupStackName}-EFSSecurityGroup"
+  MountTarget3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EFS'
+      SubnetId:
+        Fn::ImportValue: 
+          !Sub "${NetworkStackName}-PrivateSubnet3"
+      SecurityGroups:
+        - Fn::ImportValue: 
+            !Sub "${SecurityGroupStackName}-EFSSecurityGroup"
+  
+  # EC2 with Autoscaling group => ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: "ecs-cluster"
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties: 
+      LaunchTemplateName: ECS-Cluster-LaunchTemplate
+      LaunchTemplateData: 
+        SecurityGroupIds:
+          - Fn::ImportValue: 
+              !Sub "${SecurityGroupStackName}-ECSHostSecurityGroup"
+        KeyName: !Ref KeyName
+        ImageId: !FindInMap
+        - RegionAmazonECSOptimizedAMIMapping
+        - !Ref 'AWS::Region'
+        - AMI
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: 
+          Arn: 
+            Fn::ImportValue: 
+              !Sub "${IamStackName}-ECSHostsInstanceProfile-Arn"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo 'ECS_CLUSTER=${ECSCluster}' >> /etc/ecs/ecs.config
+            #Mount EFS volume
+            yum install -y nfs-utils
+            EC2_REGION="${AWS::Region}"
+            EFS_PATH=${EFS}.efs.$EC2_REGION.amazonaws.com
+            mkdir /data
+            mount -t nfs -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport $EFS_PATH:/ /data
+            # for grafana user
+            chown 472 /data
+ 
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: ECS-Cluster-AutoScalingGroup
+      VPCZoneIdentifier: 
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-PrivateSubnet1"
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-PrivateSubnet2"
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-PrivateSubnet3"
+      LaunchTemplate: 
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 2
+      DesiredCapacity: 2
+      MetricsCollection:
+        - Granularity: 1Minute
+      HealthCheckType: EC2
+      
+  # Database
+  DBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: !Sub "DB Subnet group of grafana-mysql-serverless (MySQL Aurora Serverless)"
+      DBSubnetGroupName: "grafana-db-subnet-group"
+      SubnetIds:
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-DataSubnet1"
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-DataSubnet2"
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-DataSubnet3"
+  
+  DBCluster:
+    DependsOn:
+      - DBSubnetGroup
+    Type: "AWS::RDS::DBCluster"
+    Properties:
+      DatabaseName: "grafana"
+      DBClusterIdentifier: "grafana-mysql-serverless"
+      DBClusterParameterGroupName: default.aurora5.6
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: aurora
+      EngineMode: serverless
+      EngineVersion: 5.6.10a
+      MasterUsername: "root"
+      MasterUserPassword: "ThisIsADemoPassword"
+      Port: 3306
+      ScalingConfiguration:
+        AutoPause: yes
+        MaxCapacity: 2
+        MinCapacity: 2
+        SecondsUntilAutoPause: 300
+      VpcSecurityGroupIds:
+        - Fn::ImportValue: 
+            !Sub "${SecurityGroupStackName}-MysqlSecurityGroup"
+    
+  # App
+  GrafanaCloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/ecs/grafana"
+      RetentionInDays: 7
+      
+  GrafanaTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: "grafana" 
+      #TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${TaskRole}"
+      ContainerDefinitions:
+        - Name: grafana
+          Image:  grafana/grafana:5.3.4 
+          Essential: true
+          MemoryReservation: 124
+          Cpu: 1024
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: GF_AUTH_ANONYMOUS_ENABLED
+              Value: true # Warning: Only for demo
+            - Name: GF_AUTH_BASIC_ENABLED
+              Value: true 
+            - Name: GF_DATABASE_TYPE
+              Value: "mysql"
+            - Name: GF_DATABASE_HOST
+              Value:  !Join
+                - ':'
+                - - !GetAtt 'DBCluster.Endpoint.Address'
+                  - !GetAtt 'DBCluster.Endpoint.Port'
+            - Name: GF_DATABASE_USER
+              Value: "root" # Use new secret feature with aws parameter store
+            - Name: GF_DATABASE_PASSWORD
+              Value: "ThisIsADemoPassword" # Use new secret feature with aws parameter store
+
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref GrafanaCloudwatchLogsGroup
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: grafana
+          MountPoints:
+            - SourceVolume: "data-volume"
+              ContainerPath: "/var/lib/grafana"
+      Volumes:
+        - Host:
+            SourcePath: "/data/"
+          Name: "data-volume"
+  GrafanaService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: 2
+      TaskDefinition: !Ref GrafanaTaskDefinition
+      ServiceName: "grafana"
+      Role:
+        Fn::ImportValue: 
+          !Sub "${IamStackName}-ECSServiceRole"
+      LoadBalancers: 
+        - ContainerName: grafana
+          ContainerPort: 3000
+          TargetGroupArn: !Ref GrafanaTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 100
+      HealthCheckGracePeriodSeconds: 10
+  
+  # LoadBalancer
+  GrafanaALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "Grafana-ALB" # max 32 chars.
+      Subnets:
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-PublicSubnet1"
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-PublicSubnet2"
+        - Fn::ImportValue: 
+            !Sub "${NetworkStackName}-PublicSubnet3"
+      SecurityGroups:
+        - Fn::ImportValue: 
+            !Sub "${SecurityGroupStackName}-LBSecurityGroup"
+      Scheme: 'internet-facing'
+
+  GrafanaALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GrafanaALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GrafanaTargetGroup
+
+  GrafanaTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: 
+          !Sub "${NetworkStackName}-VpcId"
+      Port: 3000
+      Protocol: HTTP
+      HealthCheckPath: "/api/health"
+      HealthCheckPort: 3000
+      HealthCheckProtocol: "HTTP" 
+      HealthyThresholdCount: 4 # >2
+      UnhealthyThresholdCount: 4
+      HealthCheckIntervalSeconds: 20
+      HealthCheckTimeoutSeconds: 5
+      Matcher:
+        HttpCode: 200
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 20
+  GrafanaDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Ref Route53HostedZone
+      Name: !Sub "grafana.${Route53HostedZone}"
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt GrafanaALB.DNSName
+        HostedZoneId: !GetAtt GrafanaALB.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+Outputs:
+  GrafanaUrl:
+    Description: Grafana URL
+    Value: !Sub "https://grafana.${Route53HostedZone}"

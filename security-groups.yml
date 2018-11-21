@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Security Groups and their configurations.
+  
+Parameters:
+  NetworkStackName:
+    Description: Stack Name of Network 
+    Type: String
+Resources:
+  LBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SecurityGroup for LB
+      VpcId: 
+        Fn::ImportValue: 
+          !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-sg-lb
+
+  ECSHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'SecurityGroup for ecs instances'
+      VpcId:         
+        Fn::ImportValue: 
+          !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref LBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-sg-ecs
+
+  ECSHostSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSHostSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ECSHostSecurityGroup
+      
+  EFSSecurityGroup:
+    DependsOn:
+    - ECSHostSecurityGroup
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EFS mount target
+      VpcId:
+        Fn::ImportValue: 
+          !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+          SourceSecurityGroupId: !Ref 'ECSHostSecurityGroup'
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-sg-efs
+  
+  MysqlSecurityGroup:
+    DependsOn:
+    - ECSHostSecurityGroup
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora Mysql
+      VpcId:
+        Fn::ImportValue: 
+          !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '3306'
+          ToPort: '3306'
+          SourceSecurityGroupId: !Ref 'ECSHostSecurityGroup'
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-sg-efs
+Outputs:
+  LBSecurityGroup:
+    Value: !Ref LBSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-LBSecurityGroup
+  ECSHostSecurityGroup:
+    Value: !Ref ECSHostSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-ECSHostSecurityGroup
+  EFSSecurityGroup:
+    Value: !Ref EFSSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-EFSSecurityGroup
+  MysqlSecurityGroup:
+    Value: !Ref MysqlSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-MysqlSecurityGroup
